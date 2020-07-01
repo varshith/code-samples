@@ -1,0 +1,68 @@
+diff --git a/docroot/modules/custom/test_global/test_global.module b/docroot/modules/custom/test_global/test_global.module
+index 6261375d8..0aadda91f 100644
+--- a/docroot/modules/custom/test_global/test_global.module
++++ b/docroot/modules/custom/test_global/test_global.module
+@@ -2491,3 +2491,30 @@ function test_global_check_and_get_parent_group($group, $get_parent = TRUE) {
+ 
+   return $group;
+ }
++
++/**
++ * Check if given view result row is for a 'generic' user.
++ *
++ * @param object $resultRow
++ *   Result row from view object.
++ *
++ * @return bool
++ *   Is this is a generic user or not.
++ */
++function _test_global_is_result_generic_user($resultRow) {
++  $related_entities = &$resultRow->_relationship_entities;
++  $profile = NULL;
++  if (isset($related_entities['profile'])) {
++    $profile = $related_entities['profile'];
++  }
++  elseif (isset($related_entities['uid']) && $resultRow->_entity->bundle() == 'profile') {
++    $profile = &$resultRow->_entity;
++  }
++  if ($profile) {
++    $first_name = $profile->get('field_profile_first_name')->getString();
++    if (stripos($first_name, 'generic') !== FALSE) {
++      return TRUE;
++    }
++  }
++  return FALSE;
++}
+diff --git a/docroot/modules/features/test_profile/test_profile.module b/docroot/modules/features/test_profile/test_profile.module
+index 328e8e475..638da6e33 100644
+--- a/docroot/modules/features/test_profile/test_profile.module
++++ b/docroot/modules/features/test_profile/test_profile.module
+@@ -487,7 +487,7 @@ function test_profile_preprocess_views_view_field(&$variables) {
+       $is_non_signatory = test_profile_user_organization_is_non_signatory(0, $row->_relationship_entities['profile']);
+     }
+ 
+-    if ($is_non_signatory) {
++    if ($is_non_signatory || _test_global_is_result_generic_user($row)) {
+       $output = NULL;
+     }
+   }
+diff --git a/docroot/modules/features/test_social_collaborations/test_social_collaborations.module b/docroot/modules/features/test_social_collaborations/test_social_collaborations.module
+index 98d613050..0f3b70720 100644
+--- a/docroot/modules/features/test_social_collaborations/test_social_collaborations.module
++++ b/docroot/modules/features/test_social_collaborations/test_social_collaborations.module
+@@ -1589,14 +1589,7 @@ function test_social_collaborations_views_pre_render(ViewExecutable $view) {
+ function _test_social_collaborations_handle_generic_members(&$view) {
+   foreach ($view->result as &$result) {
+     $related_entities = &$result->_relationship_entities;
+-    if (isset($result->_relationship_entities['profile'])) {
+-      $profile = $related_entities['profile'];
+-    }
+-    elseif (isset($result->_relationship_entities['uid']) && $result->_entity->bundle() == 'profile') {
+-      $profile = &$result->_entity;
+-    }
+-    $first_name = $profile->get('field_profile_first_name')->getString();
+-    if (stripos($first_name, 'generic') === FALSE) {
++    if (!_test_global_is_result_generic_user($result)) {
+       continue;
+     }
+     // Hide 'name' fields for generic users.

@@ -1,0 +1,144 @@
+diff --git a/html/modules/custom/test_upgrader/test_upgrader.install b/html/modules/custom/test_upgrader/test_upgrader.install
+index 490bc719b..14bcbade9 100644
+--- a/html/modules/custom/test_upgrader/test_upgrader.install
++++ b/html/modules/custom/test_upgrader/test_upgrader.install
+@@ -2484,3 +2484,10 @@ function test_upgrader_update_8332() {
+   test_revert_feature($features, TRUE);
+   test_upgrader_config_export_sync(['blocks'], 'full');
+ }
++
++/**
++ * PCP-405: Tasks features revert.
++ */
++function test_upgrader_update_8333() {
++  test_revert_feature(['test_profile'], TRUE);
++}
+diff --git a/html/modules/features/test_profile/config/install/views.view.activity_stream_profile.yml b/html/modules/features/test_profile/config/install/views.view.activity_stream_profile.yml
+index 08dbe4c96..de9831c4f 100644
+--- a/html/modules/features/test_profile/config/install/views.view.activity_stream_profile.yml
++++ b/html/modules/features/test_profile/config/install/views.view.activity_stream_profile.yml
+@@ -2,7 +2,7 @@ langcode: en
+ status: true
+ dependencies:
+   config:
+-    - message.template.announcement_created_user
++    - block.block.postonprofileblock
+     - user.role.authenticated
+   module:
+     - activity_creator
+@@ -246,46 +246,6 @@ display:
+           entity_type: activity
+           entity_field: status
+           plugin_id: boolean
+-        template:
+-          id: template
+-          table: message_field_data
+-          field: template
+-          relationship: field_activity_message
+-          group_type: group
+-          admin_label: ''
+-          operator: in
+-          value:
+-            announcement_created_user: announcement_created_user
+-          group: 2
+-          exposed: false
+-          expose:
+-            operator_id: ''
+-            label: ''
+-            description: ''
+-            use_operator: false
+-            operator: ''
+-            identifier: ''
+-            required: false
+-            remember: false
+-            multiple: false
+-            remember_roles:
+-              authenticated: authenticated
+-            reduce: false
+-          is_grouped: false
+-          group_info:
+-            label: ''
+-            description: ''
+-            identifier: ''
+-            optional: true
+-            widget: select
+-            multiple: false
+-            remember: false
+-            default_group: All
+-            default_group_multiple: {  }
+-            group_items: {  }
+-          entity_type: message
+-          entity_field: template
+-          plugin_id: bundle
+         user_id:
+           id: user_id
+           table: activity_field_data
+@@ -298,7 +258,7 @@ display:
+             min: ''
+             max: ''
+             value: view_query_alter
+-          group: 2
++          group: 1
+           exposed: false
+           expose:
+             operator_id: ''
+@@ -414,7 +374,6 @@ display:
+         operator: AND
+         groups:
+           1: AND
+-          2: OR
+     cache_metadata:
+       max-age: -1
+       contexts:
+diff --git a/html/modules/features/test_social_task/js/main.js b/html/modules/features/test_social_task/js/main.js
+index 70aab3130..6975e135e 100644
+--- a/html/modules/features/test_social_task/js/main.js
++++ b/html/modules/features/test_social_task/js/main.js
+@@ -119,9 +119,11 @@
+         attachClickHandler($task, function ($task, taskId) {
+           // Request a toggle completion page
+           sendToggleCompletionRequest(taskId).done(function (response) {
+-            var method = hasTaskBeenMarkedAsCompleted(response) ? 'add' : 'remove';
+-
+-            $task[method + 'Class']('is-complete');
++            var completed = hasTaskBeenMarkedAsCompleted(response);
++            if (completed && $(response).data().completion != 'error') {
++              var method = completed ? 'add' : 'remove';
++              $task[method + 'Class']('is-complete');
++            }
+           });
+         });
+       }
+diff --git a/html/modules/features/test_social_task/src/Controller/SocialTaskController.php b/html/modules/features/test_social_task/src/Controller/SocialTaskController.php
+index 5ffad722c..48f59f22c 100644
+--- a/html/modules/features/test_social_task/src/Controller/SocialTaskController.php
++++ b/html/modules/features/test_social_task/src/Controller/SocialTaskController.php
+@@ -120,7 +120,7 @@ class SocialTaskController extends ControllerBase {
+       }
+     }
+     else {
+-      $markup = '<div class="toggle-completion-status error" data-completion="' . $completion . '">error</div>';
++      $markup = '<div class="toggle-completion-status error" data-completion="error">error</div>';
+     }
+ 
+     exit($markup);
+diff --git a/html/themes/custom/pcp/assets/js/overrides/entity-browser.js b/html/themes/custom/pcp/assets/js/overrides/entity-browser.js
+index 705e53d63..7ba8c1db4 100644
+--- a/html/themes/custom/pcp/assets/js/overrides/entity-browser.js
++++ b/html/themes/custom/pcp/assets/js/overrides/entity-browser.js
+@@ -1,11 +1,10 @@
+ (function($) {
+   Drupal.behaviors.overrideEntityBrowserTabs = {
+     attach: function (context) {
+-      if (context === document) {
+-        overrideEntityTabs()
+-        overrideEntityBrowserTabs();
+-        overrideEntityBrowserlinkClick();
+-      }
++      // Override on every attach behaviour call.
++      overrideEntityTabs()
++      overrideEntityBrowserTabs();
++      overrideEntityBrowserlinkClick();
+     }
+   }
+ 

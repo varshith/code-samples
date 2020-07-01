@@ -1,0 +1,1077 @@
+diff --git a/html/modules/custom/test_global/test_global.module b/html/modules/custom/test_global/test_global.module
+index b434c0f52..e5506ca13 100644
+--- a/html/modules/custom/test_global/test_global.module
++++ b/html/modules/custom/test_global/test_global.module
+@@ -1893,12 +1893,8 @@ function test_global_preprocess_field(&$variables) {
+ 
+     // Always add more link if we have more than 2 comments.
+     // Calculate comment count.
+-    $comment_count = 0;
+-    foreach ($variables['comments'] as $item) {
+-      if (is_array($item) && isset($item['#comment'])) {
+-        $comment_count++;
+-      }
+-    }
++    $comment_field = $commented_entity->get($variables['element']['#field_name'])->getValue();
++    $comment_count = $comment_field[0]['comment_count'];
+ 
+     $t_args = [':num_comments' => $comment_count];
+     // Set label for comments.
+@@ -1928,6 +1924,17 @@ function test_global_preprocess_field(&$variables) {
+       $variables['more_link'] = $more_button;
+       $variables['element'][0]['more_link'] = $more_button;
+     }
++    if ($comment_count == 0) {
++      unset($variables['label']);
++      unset($variables['element'][0]['more_link']);
++    }
++    if (in_array($variables['element']['#view_mode'], ['full', 'default'])) {
++      unset($variables['element'][0]['more_link']);
++    }
++  }
++  if ($variables['element']['#formatter'] == 'test_comment_node') {
++    // Create separate variables for the more_link.
++    $variables['more_link'] = $variables['element'][0]['more_link'];
+   }
+ }
+ 
+@@ -2356,3 +2363,26 @@ function test_global_mail_alter(&$message) {
+     $message['headers']['Content-Type'] = str_replace('text/plain', 'text/html', $message['headers']['Content-Type']);
+   }
+ }
++
++/**
++ * Implements hook_ajax_render_alter().
++ */
++function test_global_ajax_render_alter(array &$data) {
++  foreach ($data as &$item) {
++    if ($item['method'] == 'replaceWith' && strpos($item['selector'], '#') === 0) {
++      $item['selector'] = '[id=' . ltrim($item['selector'], '#') . ']';
++    }
++  }
++}
++
++/**
++ * Custom after_build callback for to disable wysiwyg for comment.
++ */
++function test_global_after_build_disable_wysiwyg_for_comment($form_element, $form_state) {
++  if (isset($form_element[0]['format'])) {
++    $form_element[0]['#format'] = 'plain_text';
++    $form_element[0]['format']['#access'] = FALSE;
++  }
++
++  return $form_element;
++}
+\ No newline at end of file
+diff --git a/html/modules/custom/test_global/src/Plugin/Field/FieldFormatter/testCommentNodeFormatter.php b/html/modules/custom/test_global/src/Plugin/Field/FieldFormatter/testCommentNodeFormatter.php
+new file mode 100644
+index 000000000..332176b7c
+--- /dev/null
++++ b/html/modules/custom/test_global/src/Plugin/Field/FieldFormatter/testCommentNodeFormatter.php
+@@ -0,0 +1,275 @@
++<?php
++
++namespace Drupal\test_global\Plugin\Field\FieldFormatter;
++
++use Drupal\comment\Plugin\Field\FieldType\CommentItemInterface;
++use Drupal\comment\Plugin\Field\FieldFormatter\CommentDefaultFormatter;
++use Drupal\Core\Field\FieldItemListInterface;
++use Drupal\Core\Form\FormStateInterface;
++use Drupal\Core\Entity\EntityInterface;
++use Drupal\comment\CommentManagerInterface;
++use Drupal\comment\CommentInterface;
++use Drupal\Core\Link;
++use Drupal\group\Entity\GroupContent;
++
++/**
++ * Provides a node comment formatter.
++ *
++ * @FieldFormatter(
++ *   id = "test_comment_node",
++ *   module = "test_global",
++ *   label = @Translation("test Comment on node list"),
++ *   field_types = {
++ *     "comment"
++ *   },
++ *   quickedit = {
++ *     "editor" = "disabled"
++ *   }
++ * )
++ */
++class testCommentNodeFormatter extends CommentDefaultFormatter {
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function defaultSettings() {
++    return [
++      'num_comments' => 2,
++      'always_show_all_comments' => FALSE,
++    ];
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function viewElements(FieldItemListInterface $items, $langcode) {
++    $elements = [];
++    $output = [];
++
++    $field_name = $this->fieldDefinition->getName();
++    $entity = $items->getEntity();
++    $status = $items->status;
++    $access_comments_in_group = FALSE;
++
++    // Exclude entities without the set id.
++    if (!empty($entity->id())) {
++      $group_contents = GroupContent::loadByEntity($entity);
++    }
++
++    if (!empty($group_contents)) {
++      // Add cache contexts.
++      $elements['#cache']['contexts'][] = 'group.type';
++      $elements['#cache']['contexts'][] = 'group_membership';
++
++      $account = \Drupal::currentUser();
++      $renderer = \Drupal::service('renderer');
++
++      foreach ($group_contents as $group_content) {
++        $group = $group_content->getGroup();
++        $membership = $group->getMember($account);
++        $renderer->addCacheableDependency($elements, $membership);
++        if ($group->hasPermission('access comments', $account)) {
++          $access_comments_in_group = TRUE;
++        }
++      }
++    }
++
++    $comments_per_page = $this->getSetting('num_comments');
++
++    if ($access_comments_in_group && $status != CommentItemInterface::HIDDEN && empty($entity->in_preview) &&
++      // Comments are added to the search results and search index by
++      // comment_node_update_index() instead of by this formatter, so don't
++      // return anything if the view mode is search_index or search_result.
++      !in_array($this->viewMode, ['search_result', 'search_index'])) {
++      $comment_settings = $this->getFieldSettings();
++
++      $comment_count = $entity->get($field_name)->comment_count;
++
++      // Only attempt to render comments if the entity has visible comments.
++      // Unpublished comments are not included in
++      // $entity->get($field_name)->comment_count, but unpublished comments
++      // should display if the user is an administrator.
++      $elements['#cache']['contexts'][] = 'user.permissions';
++      if ($this->currentUser->hasPermission('access comments') || $this->currentUser->hasPermission('administer comments')) {
++        $output['comments'] = [];
++
++        if ($comment_count || $this->currentUser->hasPermission('administer comments')) {
++          $mode = $comment_settings['default_mode'];
++          $comments = $this->loadThread($entity, $field_name, $mode, $comments_per_page, FALSE);
++          if ($comments) {
++            $build = $this->viewBuilder->viewMultiple($comments);
++            $output['comments'] += $build;
++          }
++
++        }
++
++        // Prepare the show all comments link.
++        $t_args = [':num_comments' => $comment_count];
++
++        // Set link classes to be added to the button.
++        $more_link_options = [
++          'attributes' => [
++            'class' => [
++              'btn',
++              'btn-flat',
++              'brand-text-testmary',
++            ],
++          ],
++        ];
++
++        // Set path to node.
++        $link_url = $entity->urlInfo('canonical');
++
++        // Attach the attributes.
++        $link_url->setOptions($more_link_options);
++
++        if ($comment_count == 0) {
++          $more_link = $this->t(':num_comments comments', $t_args);
++          $output['more_link'] = $more_link;
++        }
++        elseif ($comment_count == 1) {
++          $more_link = $this->t(':num_comments comment', $t_args);
++          $output['more_link'] = $more_link;
++        }
++        else {
++          $more_link = $this->t('Show all :num_comments comments', $t_args);
++        }
++
++        // Build the link.
++        $more_button = Link::fromTextAndUrl($more_link, $link_url);
++
++        $always_show_all_comments = $this->getSetting('always_show_all_comments');
++        if ($always_show_all_comments && $comment_count > 1) {
++          $output['more_link'] = $more_button;
++        }
++        elseif ($comments_per_page && $comment_count > $comments_per_page) {
++          $output['more_link'] = $more_button;
++        }
++
++      }
++
++      // Append comment form if the comments are open and the form is set to
++      // display below the entity. Do not show the form for the testnt view mode.
++      if ($status == CommentItemInterface::OPEN && $comment_settings['form_location'] == CommentItemInterface::FORM_BELOW && $this->viewMode != 'testnt') {
++        // Only show the add comment form if the user has permission.
++        $elements['#cache']['contexts'][] = 'user.roles';
++        if ($this->currentUser->hasPermission('post comments')) {
++          $output['comment_form'] = [
++            '#lazy_builder' => [
++              'comment.lazy_builders:renderForm',
++              [
++                $entity->getEntityTypeId(),
++                $entity->id(),
++                $field_name,
++                $this->getFieldSetting('comment_type'),
++              ],
++            ],
++            '#create_placeholder' => TRUE,
++          ];
++        }
++      }
++
++      $elements[] = $output + [
++        '#comment_type' => $this->getFieldSetting('comment_type'),
++        '#comment_display_mode' => $this->getFieldSetting('default_mode'),
++        'comments' => [],
++        'comment_form' => [],
++        'more_link' => [],
++      ];
++    }
++
++    return $elements;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function settingsForm(array $form, FormStateInterface $form_state) {
++    $element = [];
++    $element['num_comments'] = [
++      '#type' => 'number',
++      '#min' => 0,
++      '#max' => 10,
++      '#title' => $this->t('Number of comments'),
++      '#default_value' => $this->getSetting('num_comments'),
++    ];
++    $orders = [
++      'ASC' => $this->t('Oldest first'),
++      'DESC' => $this->t('Newest first'),
++    ];
++    $element['order'] = [
++      '#type' => 'select',
++      '#title' => $this->t('Order'),
++      '#description' => $this->t('Select the order used to show the list of comments.'),
++      '#default_value' => $this->getSetting('order'),
++      '#options' => $orders,
++    ];
++    $element['always_show_all_comments'] = [
++      '#type' => 'checkbox',
++      '#title' => $this->t('Always show all comments link'),
++      '#description' => $this->t('If selected it will show a "all comments" link if there is at least 1 comment.'),
++      '#default_value' => $this->getSetting('always_show_all_comments'),
++    ];
++    return $element;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function settingsSummary() {
++    return [];
++  }
++
++  /**
++   * {@inheritdoc}
++   *
++   * @see Drupal\comment\CommentStorage::loadThead()
++   */
++  public function loadThread(EntityInterface $entity, $field_name, $mode, $comments_per_page = 0, $pager_id = 0) {
++    // @TODO: Refactor this to use CommentDefaultFormatter->loadThread with dependency injection instead.
++    $query = db_select('comment_field_data', 'c');
++    $query->addField('c', 'cid');
++    $query
++      ->condition('c.entity_id', $entity->id())
++      ->condition('c.entity_type', $entity->getEntityTypeId())
++      ->condition('c.field_name', $field_name)
++      ->condition('c.default_langcode', 1)
++      ->condition('c.pid', 0)
++      ->addTag('entity_access')
++      ->addTag('comment_filter')
++      ->addMetaData('base_table', 'comment')
++      ->addMetaData('entity', $entity)
++      ->addMetaData('field_name', $field_name);
++
++    $comments_order = $this->getSetting('order');
++
++    if (!$this->currentUser->hasPermission('administer comments')) {
++      $query->condition('c.status', CommentInterface::PUBLISHED);
++    }
++    if ($mode == CommentManagerInterface::COMMENT_MODE_FLAT) {
++      $query->orderBy('c.cid', $comments_order);
++    }
++    else {
++      // See comment above. Analysis reveals that this doesn't cost too
++      // much. It scales much much better than having the whole comment
++      // structure.
++      $query->addExpression('SUBSTRING(c.thread, 1, (LENGTH(c.thread) - 1))', 'torder');
++      $query->orderBy('torder', 'DESC');
++    }
++
++    // Limit The number of results.
++    if ($comments_per_page) {
++      $query->range(0, $comments_per_page);
++    }
++
++    $cids = $query->execute()->fetchCol();
++
++    $comments = [];
++    if ($cids) {
++      $comments = entity_load_multiple('comment', $cids);
++    }
++
++    return $comments;
++  }
++
++}
+diff --git a/html/modules/features/test_social_attachment/test_social_attachment.module b/html/modules/features/test_social_attachment/test_social_attachment.module
+index e55a49bc2..2d322c6bc 100644
+--- a/html/modules/features/test_social_attachment/test_social_attachment.module
++++ b/html/modules/features/test_social_attachment/test_social_attachment.module
+@@ -128,22 +128,10 @@ function test_social_attachment_form_alter(&$form, FormStateInterface $form_state
+ 
+   if ($form_id == 'comment_attachment_comment_form') {
+     // Disable wysiwyg for comment field.
+-    $form['comment_body']['widget']['#after_build'][] = '_test_social_attachments_disable_wysiwyg_for_element';
++    $form['comment_body']['widget']['#after_build'][] = 'test_global_after_build_disable_wysiwyg_for_comment';
+   }
+ }
+ 
+-/**
+- * Custom after_build callback for comment_body to disable wysiwyg for comment.
+- */
+-function _test_social_attachments_disable_wysiwyg_for_element($form_element, $form_state) {
+-  if (isset($form_element[0]['format'])) {
+-    $form_element[0]['#format'] = 'plain_text';
+-    $form_element[0]['format']['#access'] = FALSE;
+-  }
+-
+-  return $form_element;
+-}
+-
+ /**
+  * Implements hook_form_alter().
+  */
+diff --git a/html/modules/features/test_social_task/config/install/comment.type.task_comment.yml b/html/modules/features/test_social_task/config/install/comment.type.task_comment.yml
+new file mode 100644
+index 000000000..543ef1b33
+--- /dev/null
++++ b/html/modules/features/test_social_task/config/install/comment.type.task_comment.yml
+@@ -0,0 +1,7 @@
++langcode: en
++status: true
++dependencies: {  }
++id: task_comment
++label: 'Task comment'
++target_entity_type_id: node
++description: 'Comments for tasks.'
+diff --git a/html/modules/features/test_social_task/config/install/core.entity_form_display.comment.task_comment.default.yml b/html/modules/features/test_social_task/config/install/core.entity_form_display.comment.task_comment.default.yml
+new file mode 100644
+index 000000000..f47526eba
+--- /dev/null
++++ b/html/modules/features/test_social_task/config/install/core.entity_form_display.comment.task_comment.default.yml
+@@ -0,0 +1,28 @@
++langcode: en
++status: true
++dependencies:
++  config:
++    - comment.type.task_comment
++    - field.field.comment.task_comment.field_comment_body
++  module:
++    - text
++id: comment.task_comment.default
++targetEntityType: comment
++bundle: task_comment
++mode: default
++content:
++  author:
++    weight: 2
++    region: content
++    settings: {  }
++    third_party_settings: {  }
++  field_comment_body:
++    weight: 0
++    settings:
++      rows: 5
++      placeholder: ''
++    third_party_settings: {  }
++    type: text_textarea
++    region: content
++hidden:
++  subject: true
+diff --git a/html/modules/features/test_social_task/config/install/core.entity_form_display.node.task.default.yml b/html/modules/features/test_social_task/config/install/core.entity_form_display.node.task.default.yml
+index c163823e9..088259baa 100644
+--- a/html/modules/features/test_social_task/config/install/core.entity_form_display.node.task.default.yml
++++ b/html/modules/features/test_social_task/config/install/core.entity_form_display.node.task.default.yml
+@@ -4,12 +4,14 @@ dependencies:
+   config:
+     - field.field.node.task.field_content_visibility
+     - field.field.node.task.field_task_assignee
++    - field.field.node.task.field_task_comments
+     - field.field.node.task.field_task_completion_date
+     - field.field.node.task.field_task_deadline
+     - field.field.node.task.field_task_folder
+     - field.field.node.task.field_task_type
+     - node.type.task
+   module:
++    - comment
+     - datetime
+     - field_group
+     - path
+@@ -72,6 +74,12 @@ content:
+     third_party_settings: {  }
+     type: entity_reference_autocomplete
+     region: content
++  field_task_comments:
++    weight: 26
++    settings: {  }
++    third_party_settings: {  }
++    type: comment_default
++    region: content
+   field_task_completion_date:
+     type: datetime_default
+     weight: 2
+diff --git a/html/modules/features/test_social_task/config/install/core.entity_view_display.comment.task_comment.default.yml b/html/modules/features/test_social_task/config/install/core.entity_view_display.comment.task_comment.default.yml
+new file mode 100644
+index 000000000..06e7ef7f4
+--- /dev/null
++++ b/html/modules/features/test_social_task/config/install/core.entity_view_display.comment.task_comment.default.yml
+@@ -0,0 +1,26 @@
++langcode: en
++status: true
++dependencies:
++  config:
++    - comment.type.task_comment
++    - field.field.comment.task_comment.field_comment_body
++  module:
++    - text
++id: comment.task_comment.default
++targetEntityType: comment
++bundle: task_comment
++mode: default
++content:
++  field_comment_body:
++    type: text_default
++    weight: 0
++    region: content
++    label: above
++    settings: {  }
++    third_party_settings: {  }
++  links:
++    weight: 1
++    region: content
++    settings: {  }
++    third_party_settings: {  }
++hidden: {  }
+diff --git a/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.activity.yml b/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.activity.yml
+new file mode 100644
+index 000000000..9fbb72381
+--- /dev/null
++++ b/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.activity.yml
+@@ -0,0 +1,105 @@
++langcode: en
++status: true
++dependencies:
++  config:
++    - core.entity_view_mode.node.activity
++    - field.field.node.task.field_content_visibility
++    - field.field.node.task.field_task_assignee
++    - field.field.node.task.field_task_comments
++    - field.field.node.task.field_task_completion_date
++    - field.field.node.task.field_task_deadline
++    - field.field.node.task.field_task_folder
++    - field.field.node.task.field_task_type
++    - node.type.task
++  module:
++    - ajax_comments
++    - datetime
++    - test_global
++    - user
++id: node.task.activity
++targetEntityType: node
++bundle: task
++mode: activity
++content:
++  field_task_assignee:
++    weight: 2
++    label: inline
++    settings:
++      view_mode: small
++      link: false
++    third_party_settings: {  }
++    type: entity_reference_entity_view
++    region: content
++  field_task_comments:
++    weight: 7
++    label: above
++    settings:
++      num_comments: '2'
++      always_show_all_comments: 0
++    third_party_settings:
++      ajax_comments:
++        enable_ajax_comments: '1'
++    type: test_comment_node
++    region: content
++  field_task_completion_date:
++    weight: 4
++    label: inline
++    settings:
++      format_type: medium
++      timezone_override: ''
++    third_party_settings: {  }
++    type: datetime_default
++    region: content
++  field_task_deadline:
++    weight: 3
++    label: inline
++    settings:
++      format_type: medium
++      timezone_override: ''
++    third_party_settings: {  }
++    type: datetime_default
++    region: content
++  field_task_folder:
++    weight: 5
++    label: inline
++    settings:
++      link: false
++    third_party_settings: {  }
++    type: entity_reference_label
++    region: content
++  groups_type_collaboration:
++    label: above
++    weight: 0
++    region: content
++    settings:
++      link: true
++    third_party_settings: {  }
++    type: entity_reference_label
++  groups_type_public_group:
++    label: above
++    weight: 6
++    region: content
++    settings:
++      link: true
++    third_party_settings: {  }
++    type: entity_reference_label
++  groups_type_subspace:
++    label: above
++    weight: 1
++    region: content
++    settings:
++      link: true
++    third_party_settings: {  }
++    type: entity_reference_label
++  links:
++    weight: 8
++    region: content
++    settings: {  }
++    third_party_settings: {  }
++hidden:
++  field_content_visibility: true
++  field_task_type: true
++  flag_follow_content: true
++  groups: true
++  groups_type_closed_group: true
++  groups_type_open_group: true
+diff --git a/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.activity_comment.yml b/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.activity_comment.yml
+new file mode 100644
+index 000000000..73ad0624f
+--- /dev/null
++++ b/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.activity_comment.yml
+@@ -0,0 +1,99 @@
++langcode: en
++status: false
++dependencies:
++  config:
++    - core.entity_view_display.comment.task_comment.default
++    - core.entity_view_mode.node.activity_comment
++    - field.field.node.task.field_content_visibility
++    - field.field.node.task.field_task_assignee
++    - field.field.node.task.field_task_comments
++    - field.field.node.task.field_task_completion_date
++    - field.field.node.task.field_task_deadline
++    - field.field.node.task.field_task_folder
++    - field.field.node.task.field_task_type
++    - node.type.task
++  module:
++    - comment
++    - datetime
++    - user
++id: node.task.activity_comment
++targetEntityType: node
++bundle: task
++mode: activity_comment
++content:
++  field_task_assignee:
++    weight: 0
++    label: inline
++    settings:
++      view_mode: small
++      link: false
++    third_party_settings: {  }
++    type: entity_reference_entity_view
++    region: content
++  field_task_comments:
++    weight: 5
++    label: above
++    settings:
++      view_mode: default
++      pager_id: 0
++    third_party_settings: {  }
++    type: comment_default
++    region: content
++  field_task_completion_date:
++    weight: 2
++    label: inline
++    settings:
++      format_type: medium
++      timezone_override: ''
++    third_party_settings: {  }
++    type: datetime_default
++    region: content
++  field_task_deadline:
++    weight: 1
++    label: inline
++    settings:
++      format_type: medium
++      timezone_override: ''
++    third_party_settings: {  }
++    type: datetime_default
++    region: content
++  field_task_folder:
++    weight: 3
++    label: inline
++    settings:
++      link: false
++    third_party_settings: {  }
++    type: entity_reference_label
++    region: content
++  groups_type_collaboration:
++    label: above
++    weight: -5
++    region: content
++    settings:
++      link: true
++    third_party_settings: {  }
++    type: entity_reference_label
++  groups_type_public_group:
++    label: above
++    weight: 4
++    region: content
++    settings:
++      link: true
++    third_party_settings: {  }
++    type: entity_reference_label
++  groups_type_subspace:
++    label: above
++    weight: -5
++    region: content
++    settings:
++      link: true
++    third_party_settings: {  }
++    type: entity_reference_label
++hidden:
++  field_content_visibility: true
++  field_task_type: true
++  flag_follow_content: true
++  groups: true
++  groups_type_closed_group: true
++  groups_type_open_group: true
++  links: true
+diff --git a/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.comments.yml b/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.comments.yml
+new file mode 100644
+index 000000000..f7155b691
+--- /dev/null
++++ b/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.comments.yml
+@@ -0,0 +1,99 @@
++langcode: en
++status: false
++dependencies:
++  config:
++    - core.entity_view_display.comment.task_comment.default
++    - core.entity_view_mode.node.comments
++    - field.field.node.task.field_content_visibility
++    - field.field.node.task.field_task_assignee
++    - field.field.node.task.field_task_comments
++    - field.field.node.task.field_task_completion_date
++    - field.field.node.task.field_task_deadline
++    - field.field.node.task.field_task_folder
++    - field.field.node.task.field_task_type
++    - node.type.task
++  module:
++    - comment
++    - datetime
++    - user
++id: node.task.comments
++targetEntityType: node
++bundle: task
++mode: comments
++content:
++  field_task_assignee:
++    weight: 0
++    label: inline
++    settings:
++      view_mode: small
++      link: false
++    third_party_settings: {  }
++    type: entity_reference_entity_view
++    region: content
++  field_task_comments:
++    weight: 5
++    label: above
++    settings:
++      view_mode: default
++      pager_id: 0
++    third_party_settings: {  }
++    type: comment_default
++    region: content
++  field_task_completion_date:
++    weight: 2
++    label: inline
++    settings:
++      format_type: medium
++      timezone_override: ''
++    third_party_settings: {  }
++    type: datetime_default
++    region: content
++  field_task_deadline:
++    weight: 1
++    label: inline
++    settings:
++      format_type: medium
++      timezone_override: ''
++    third_party_settings: {  }
++    type: datetime_default
++    region: content
++  field_task_folder:
++    weight: 3
++    label: inline
++    settings:
++      link: false
++    third_party_settings: {  }
++    type: entity_reference_label
++    region: content
++  groups_type_collaboration:
++    label: above
++    weight: -5
++    region: content
++    settings:
++      link: true
++    third_party_settings: {  }
++    type: entity_reference_label
++  groups_type_public_group:
++    label: above
++    weight: 4
++    region: content
++    settings:
++      link: true
++    third_party_settings: {  }
++    type: entity_reference_label
++  groups_type_subspace:
++    label: above
++    weight: -5
++    region: content
++    settings:
++      link: true
++    third_party_settings: {  }
++    type: entity_reference_label
++hidden:
++  field_content_visibility: true
++  field_task_type: true
++  flag_follow_content: true
++  groups: true
++  groups_type_closed_group: true
++  groups_type_open_group: true
++  links: true
+diff --git a/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.default.yml b/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.default.yml
+index 3b9f1cc33..0e31d6413 100644
+--- a/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.default.yml
++++ b/html/modules/features/test_social_task/config/install/core.entity_view_display.node.task.default.yml
+@@ -4,13 +4,16 @@ dependencies:
+   config:
+     - field.field.node.task.field_content_visibility
+     - field.field.node.task.field_task_assignee
++    - field.field.node.task.field_task_comments
+     - field.field.node.task.field_task_completion_date
+     - field.field.node.task.field_task_deadline
+     - field.field.node.task.field_task_folder
+     - field.field.node.task.field_task_type
+     - node.type.task
+   module:
++    - ajax_comments
+     - datetime
++    - test_global
+     - user
+ id: node.task.default
+ targetEntityType: node
+@@ -26,6 +29,17 @@ content:
+     third_party_settings: {  }
+     type: entity_reference_entity_view
+     region: content
++  field_task_comments:
++    weight: 5
++    label: above
++    settings:
++      num_comments: ''
++      always_show_all_comments: 0
++    third_party_settings:
++      ajax_comments:
++        enable_ajax_comments: '1'
++    type: test_comment_node
++    region: content
+   field_task_completion_date:
+     weight: 2
+     label: inline
+diff --git a/html/modules/features/test_social_task/config/install/field.field.comment.task_comment.field_comment_body.yml b/html/modules/features/test_social_task/config/install/field.field.comment.task_comment.field_comment_body.yml
+new file mode 100644
+index 000000000..c16e456fc
+--- /dev/null
++++ b/html/modules/features/test_social_task/config/install/field.field.comment.task_comment.field_comment_body.yml
+@@ -0,0 +1,20 @@
++langcode: en
++status: true
++dependencies:
++  config:
++    - comment.type.task_comment
++    - field.storage.comment.field_comment_body
++  module:
++    - text
++id: comment.task_comment.field_comment_body
++field_name: field_comment_body
++entity_type: comment
++bundle: task_comment
++label: Comment
++description: ''
++required: true
++translatable: true
++default_value: {  }
++default_value_callback: ''
++settings: {  }
++field_type: text_long
+diff --git a/html/modules/features/test_social_task/config/install/field.field.node.task.field_task_comments.yml b/html/modules/features/test_social_task/config/install/field.field.node.task.field_task_comments.yml
+new file mode 100644
+index 000000000..d7f6ea037
+--- /dev/null
++++ b/html/modules/features/test_social_task/config/install/field.field.node.task.field_task_comments.yml
+@@ -0,0 +1,32 @@
++langcode: en
++status: true
++dependencies:
++  config:
++    - field.storage.node.field_task_comments
++    - node.type.task
++  module:
++    - comment
++id: node.task.field_task_comments
++field_name: field_task_comments
++entity_type: node
++bundle: task
++label: Comments
++description: ''
++required: false
++translatable: false
++default_value:
++  -
++    status: 2
++    cid: 0
++    last_comment_timestamp: 0
++    last_comment_name: null
++    last_comment_uid: 0
++    comment_count: 0
++default_value_callback: ''
++settings:
++  default_mode: 1
++  per_page: 50
++  anonymous: 0
++  form_location: true
++  preview: 0
++field_type: comment
+diff --git a/html/modules/features/test_social_task/config/install/field.storage.node.field_task_comments.yml b/html/modules/features/test_social_task/config/install/field.storage.node.field_task_comments.yml
+new file mode 100644
+index 000000000..08a33a035
+--- /dev/null
++++ b/html/modules/features/test_social_task/config/install/field.storage.node.field_task_comments.yml
+@@ -0,0 +1,19 @@
++langcode: en
++status: true
++dependencies:
++  module:
++    - comment
++    - node
++id: node.field_task_comments
++field_name: field_task_comments
++entity_type: node
++type: comment
++settings:
++  comment_type: task_comment
++module: comment
++locked: false
++cardinality: 1
++translatable: true
++indexes: {  }
++persist_with_no_fields: false
++custom_storage: false
+diff --git a/html/modules/features/test_social_task/test_social_task.module b/html/modules/features/test_social_task/test_social_task.module
+index 3dccdc49a..e30d50d77 100644
+--- a/html/modules/features/test_social_task/test_social_task.module
++++ b/html/modules/features/test_social_task/test_social_task.module
+@@ -482,7 +482,7 @@ function test_social_task_form_alter(&$form, FormStateInterface $form_state, $for
+     // Folder id is added to the form action url, but we need to remove '0' -
+     // root folder id. Let's remove it: /group/123/tasks/0 -> /group/123/tasks.
+     $form["#action"] = explode('/', $form["#action"]);
+-    if ($form["#action"][count($form["#action"])-1] == '0') {
++    if ($form["#action"][count($form["#action"]) - 1] == '0') {
+       unset($form["#action"][count($form["#action"]) - 1]);
+     }
+     $form["#action"] = implode('/', $form["#action"]);
+@@ -492,9 +492,17 @@ function test_social_task_form_alter(&$form, FormStateInterface $form_state, $for
+     // User id is added to the form action url, but we need to avoid this.
+     // Let's remove it: /user/tasks/123 -> /user/tasks.
+     $form["#action"] = explode('/', $form["#action"]);
+-    unset($form["#action"][count($form["#action"])-1]);
++    unset($form["#action"][count($form["#action"]) - 1]);
+     $form["#action"] = implode('/', $form["#action"]);
+   }
++  elseif ($form_id == 'comment_task_comment_form') {
++    // Hide title of 'Comment' field.
++    if (!empty($form['field_comment_body']['widget'][0]['value']['#title_display'])) {
++      $form['field_comment_body']['widget'][0]['value']['#title_display'] = 'invisible';
++    }
++    // Disable wysiwyg for comment field.
++    $form['field_comment_body']['widget']['#after_build'][] = 'test_global_after_build_disable_wysiwyg_for_comment';
++  }
+ }
+ 
+ /**
+@@ -647,7 +655,7 @@ function test_social_task_views_query_alter(ViewExecutable $view, QueryPluginBase
+ 
+     // Find draggableviews field.
+     $weight_field = NULL;
+-    foreach($query->fields as $field) {
++    foreach ($query->fields as $field) {
+       if (strstr($field['table'], 'draggableviews')) {
+         $weight_field = $field;
+         break;
+diff --git a/html/themes/custom/pcp/assets/js/main.js b/html/themes/custom/pcp/assets/js/main.js
+index 415b7d806..d025759ad 100644
+--- a/html/themes/custom/pcp/assets/js/main.js
++++ b/html/themes/custom/pcp/assets/js/main.js
+@@ -1470,6 +1470,66 @@
+     }
+   }
+ 
++  /**
++   * Update ajax task comments in collaboration feeds.
++   * Here we remove all comments and only have latest 2 after ajax request
++   * and also update comment counts.
++   */
++  Drupal.behaviors.updateTaskComments = {
++    attach: function (context) {
++      var commentCount = 0;
++      var id, size;
++      var streamItem = $(context).closest('.stream-item');
++
++      if (streamItem.length) {
++        id = $(context).attr('id');
++        $('[id="' + id + '"]').each(function () {
++          commentCount = 0;
++          size = $(this).find('> .comment__wrapper > .js-comment').length;
++          $(this).find('> .comment__wrapper > .js-comment').each(function () {
++            commentCount++;
++            // Only show 2 comments.
++            if (commentCount > 2) {
++              $(this).remove();
++            }
++          });
++
++          if (commentCount > 0) {
++            // Update comment count in markup to match new commentCount.
++            streamItem.find('.comment__counts, .comment__show-all>a').text(function (i, txt) {
++              return txt.replace(/\d+/, commentCount);
++            });
++          }
++        });
++      }
++    }
++  }
++
++  /**
++   * Disable comment submit button when coment textarea is empty.
++   */
++  Drupal.behaviors.emptyCommentSubmit = {
++    attach: function (context) {
++      $(context).find('.btn--comment-submit').each(function() {
++        $(this).prop('disabled', true);
++
++        $(this).closest('form').find('textarea[name="field_comment_body[0][value]"]').each(function() {
++          $(this).on('change keyup paste', function() {
++            var val = $(this).val();
++            var button = $(this).closest('form').find('.btn--comment-submit');
++
++            if (val.trim().length == 0) {
++              $(button).prop('disabled', true);
++            }
++            else {
++              $(button).prop('disabled', false);
++            }
++          });
++        });
++      });
++    },
++  }
++
+   /**
+    * Update ajax post comments in collaboration feeds.
+    */
+diff --git a/html/themes/custom/pcp/pcp.theme b/html/themes/custom/pcp/pcp.theme
+index a5e91b74f..be0ad93bc 100644
+--- a/html/themes/custom/pcp/pcp.theme
++++ b/html/themes/custom/pcp/pcp.theme
+@@ -65,6 +65,15 @@ function pcp_preprocess_node(&$variables) {
+   }
+ 
+   $variables['inside_iframe'] = \Drupal::request()->query->get('iframe');
++
++  if ($variables['content_type'] == 'task' && $variables['view_mode'] == 'activity') {
++    if (isset($variables['below_content']['field_task_comments'][0]['comment_form']['#lazy_builder'])) {
++      // This makes sure lazy_builder rebuilds the comment form for each form in the page.
++      // When this is not there, multiple forms in the same view has same form markup
++      // including same form #id etc which breaks ajax.
++      $variables['below_content']['field_task_comments'][0]['comment_form']['#lazy_builder'][1][] = rand();
++    }
++  }
+ }
+ 
+ /**
+@@ -792,7 +801,9 @@ function pcp_theme_suggestions_image_widget_alter(array &$suggestions, array $va
+ function pcp_theme_suggestions_form_alter(array &$suggestions, array $variables) {
+   // Override form--comment template from socialbase theme to hide form when
+   // the collaboration was disabled.
+-  if ($variables['element']['#form_id'] == 'comment_post_comment_form') {
++  $comment_forms = ['comment_post_comment_form', 'comment_task_comment_form'];
++  $form_id = $variables['element']['#form_id'];
++  if (in_array($form_id, $comment_forms)) {
+     if (\Drupal::routeMatch()->getRouteName() === 'entity.comment.edit_form') {
+       $suggestions = [$variables['theme_hook_original'] . '__' . 'comment_edit'];
+     }
